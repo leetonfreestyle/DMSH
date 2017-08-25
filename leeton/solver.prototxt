@@ -1,0 +1,17 @@
+net: "leeton/caffenet.prototxt"
+test_iter: 50
+test_interval: 1000
+test_initialization: false
+base_lr: 0.001
+momentum: 0.9
+weight_decay: 0.004
+lr_policy: "step"
+gamma: 0.6
+stepsize: 20000
+display: 100
+average_loss: 100
+max_iter: 150000
+snapshot: 10000
+snapshot_prefix: "leeton/snapshots/caffenet"
+solver_mode: GPU
+device_id: 0
