@@ -1,19 +1,41 @@
+<<<<<<< HEAD
 ## General
+=======
+# Prerequisites
+*.d
+>>>>>>> 077693f0344e8465332bef5b031b80e76f12bc4a
 
 # Compiled Object files
 *.slo
 *.lo
 *.o
+<<<<<<< HEAD
 *.cuo
+=======
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+>>>>>>> 077693f0344e8465332bef5b031b80e76f12bc4a
 
 # Compiled Dynamic libraries
 *.so
 *.dylib
+<<<<<<< HEAD
+=======
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+>>>>>>> 077693f0344e8465332bef5b031b80e76f12bc4a
 
 # Compiled Static libraries
 *.lai
 *.la
 *.a
+<<<<<<< HEAD
 
 # Compiled protocol buffers
 *.pb.h
@@ -87,3 +109,11 @@ MANIFEST-*
 
 README.md.bak
 data/
+=======
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+>>>>>>> 077693f0344e8465332bef5b031b80e76f12bc4a
