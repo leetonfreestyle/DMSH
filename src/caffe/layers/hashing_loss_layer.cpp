@@ -85,7 +85,7 @@ void HashingLossLayer<Dtype>::Forward_cpu(
         //Dtype sim_margin = channels * Dtype(4.0) * (
         //    std::pow(margin, - temp_.cpu_data()[i * num * 2 + j * 2]));
         // Dtype sim_margin = Dtype(4.0) * margin;
-        sim_margin = channels * Dtype(4.0) * margin * (
+        Dtype sim_margin = channels * Dtype(4.0) * margin * (
             std::exp(- temp_.cpu_data()[i * num * 2 + j * 2]));
         //Dtype sim_margin = channels * Dtype(4.0) * (Dtype(1.0) / margin - Dtype(0.1) * temp_.cpu_data()[i * num * 2 + j * 2]);
         loss += std::max(dist_sq - sim_margin, Dtype(0.0));
