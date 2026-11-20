@@ -25,7 +25,8 @@ from model import DMSHNet
 
 def parse_args():
     p = argparse.ArgumentParser(description="DMSH (PyTorch) on CIFAR-10")
-    p.add_argument("--data-root", default="pytorch_dmsh/data")
+    p.add_argument("--data-root",
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
     p.add_argument("--output-dir",
                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"))
     p.add_argument("--bits", type=int, default=48)
@@ -40,6 +41,7 @@ def parse_args():
     p.add_argument("--query-per-class", type=int, default=None)
     p.add_argument("--database-per-class", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=0, help="每 N 个 epoch 评估一次，0=仅训练后评估")
+    p.add_argument("--resume", default=None, help="从该 checkpoint 续训（恢复权重/epoch/best_mAP）")
     p.add_argument("--smoke-test", action="store_true", help="小样本快速验证 GPU 训练与检索")
     return p.parse_args()
 
@@ -77,8 +79,22 @@ def main():
                          tradeoff=args.tradeoff, nsim=args.nsim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    start_epoch = 0
+    best_map = -1.0
+    if args.resume:
+        ck = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        start_epoch = int(ck.get("epoch", 0))
+        best_map = float(ck.get("best_mAP", ck.get("mAP", -1.0)))
+        print(f"[resume] loaded {args.resume}: epoch={start_epoch} best_mAP={best_map:.4f}")
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, last_epoch=start_epoch - 1)
+
     history = []
-    for epoch in range(1, args.epochs + 1):
+    last_ckpt = os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_last.pt")
+    best_ckpt = os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_best.pt")
+    eval_done = False
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         t0 = time.time()
         agg = {"loss": 0.0, "pair_loss": 0.0, "reg": 0.0, "sim_ratio": 0.0}
@@ -100,34 +116,55 @@ def main():
                 print(f"[debug] codes shape={tuple(codes.shape)} device={codes.device} "
                       f"kept_pairs={stats['kept_pairs']}")
 
+        scheduler.step()
         for k in agg:
             agg[k] /= max(n_batch, 1)
         msg = (f"[epoch {epoch}/{args.epochs}] loss={agg['loss']:.4f} "
                f"pair={agg['pair_loss']:.4f} reg={agg['reg']:.4f} "
                f"sim_ratio={agg['sim_ratio']:.3f} "
-               f"time={time.time() - t0:.1f}s")
+               f"lr={scheduler.get_last_lr()[0]:.2e} time={time.time() - t0:.1f}s")
         if device.type == "cuda":
             msg += f" max_mem={torch.cuda.max_memory_allocated() / 1024 ** 2:.0f}MB"
-        print(msg)
-        history.append({"epoch": epoch, **agg})
+        print(msg, flush=True)
 
-        if args.eval_every and epoch % args.eval_every == 0 and epoch < args.epochs:
+        do_eval = (epoch == args.epochs) or (bool(args.eval_every) and epoch % args.eval_every == 0)
+        cur_map = None
+        if do_eval:
             result = evaluate(model, query_loader, db_loader, device, args.bits)
-            print(f"    -> mAP@all = {result['mAP']:.4f}")
+            cur_map = result["mAP"]
+            eval_done = (epoch == args.epochs)
+            tag = ""
+            if cur_map > best_map:
+                best_map = cur_map
+                torch.save({"model": model.state_dict(), "args": vars(args),
+                            "epoch": epoch, "best_mAP": best_map, "mAP": cur_map}, best_ckpt)
+                tag = " *BEST*"
+            print(f"    -> mAP@all={cur_map:.4f} (best={best_map:.4f}){tag}", flush=True)
 
-    result = evaluate(model, query_loader, db_loader, device, args.bits)
-    print(f"[final] bits={args.bits} mAP@all={result['mAP']:.4f} "
+        history.append({"epoch": epoch, **agg, "mAP": cur_map, "best_mAP": best_map})
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "args": vars(args), "epoch": epoch, "best_mAP": best_map}, last_ckpt)
+
+    if not eval_done:
+        result = evaluate(model, query_loader, db_loader, device, args.bits)
+        cur_map = result["mAP"]
+        if cur_map > best_map:
+            best_map = cur_map
+            torch.save({"model": model.state_dict(), "args": vars(args),
+                        "epoch": args.epochs, "best_mAP": best_map, "mAP": cur_map}, best_ckpt)
+        history[-1]["mAP"] = cur_map
+        history[-1]["best_mAP"] = best_map
+        print(f"    -> mAP@all={cur_map:.4f} (best={best_map:.4f})", flush=True)
+
+    print(f"[final] bits={args.bits} best_mAP@all={best_map:.4f} "
           f"(query={len(result['query_codes'])}, database={len(result['db_codes'])})")
-
-    ckpt = os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit.pt")
-    torch.save({"model": model.state_dict(), "args": vars(args), "mAP": result["mAP"]}, ckpt)
     np.savez_compressed(os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_codes.npz"),
                         query_codes=result["query_codes"], db_codes=result["db_codes"],
                         query_labels=result["query_labels"], db_labels=result["db_labels"])
     with open(os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_history.json"), "w",
               encoding="utf-8") as f:
         json.dump(history, f, indent=2)
-    print(f"[save] checkpoint={ckpt}")
+    print(f"[save] last={last_ckpt} best={best_ckpt}", flush=True)
 
 
 if __name__ == "__main__":
