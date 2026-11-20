@@ -1,0 +1,9 @@
+# 数据集（CIFAR-10）与解压产物，约 340MB，不入库
+data/
+
+# 训练产物：checkpoint / 哈希码 / 历史
+outputs/
+
+# Python 缓存
+__pycache__/
+*.pyc
