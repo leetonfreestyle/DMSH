@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from data import build_loaders
+from data_coco import build_coco_loaders
 from evaluate import evaluate
 from losses import DMSHLoss
 from model import DMSHNet
@@ -42,6 +43,17 @@ def parse_args():
     p.add_argument("--database-per-class", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=0, help="每 N 个 epoch 评估一次，0=仅训练后评估")
     p.add_argument("--resume", default=None, help="从该 checkpoint 续训（恢复权重/epoch/best_mAP）")
+    p.add_argument("--dataset", choices=["cifar10", "coco"], default="cifar10")
+    p.add_argument("--backbone", choices=["cifar", "resnet18"], default="cifar")
+    p.add_argument("--pretrained", action="store_true", help="resnet18 使用 ImageNet 预训练权重")
+    p.add_argument("--img-size", type=int, default=32)
+    p.add_argument("--coco-root", default=r"F:\数据集\mscoco2017")
+    p.add_argument("--coco-split", default="val2017")
+    p.add_argument("--min-class-count", type=int, default=0, help="COCO 标注中剔除频次低于该值的类别")
+    p.add_argument("--coco-max-images", type=int, default=None, help="COCO 小规模验证时随机取图数量")
+    p.add_argument("--coco-val-ratio", type=float, default=0.2, help="COCO 从同 split 切出的查询集比例")
+    p.add_argument("--coco-balanced", action="store_true", help="COCO 训练启用类别均衡采样")
+    p.add_argument("--map-k", type=int, default=None, help="评估 mAP@K；缺省为 mAP@all")
     p.add_argument("--smoke-test", action="store_true", help="小样本快速验证 GPU 训练与检索")
     return p.parse_args()
 
@@ -65,16 +77,33 @@ def main():
         print("[env] 警告：未检测到可用 CUDA，将在 CPU 上运行")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    train_loader, query_loader, db_loader = build_loaders(
-        args.data_root, batch_size=args.batch_size, num_workers=args.num_workers,
-        train_per_class=args.train_per_class,
-        query_per_class=args.query_per_class,
-        database_per_class=args.database_per_class,
-    )
-    print(f"[data] train={len(train_loader.dataset)} query={len(query_loader.dataset)} "
-          f"database={len(db_loader.dataset)} (CIFAR-10, 无代理下载)")
+    metric_name = f"mAP@{args.map_k}" if args.map_k else "mAP@all"
+    num_classes = 10
+    if args.dataset == "coco":
+        train_loader, query_loader, db_loader, coco_info = build_coco_loaders(
+            args.coco_root, split=args.coco_split, img_size=args.img_size,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            min_class_count=args.min_class_count, max_images=args.coco_max_images,
+            val_ratio=args.coco_val_ratio, balanced=args.coco_balanced,
+        )
+        num_classes = coco_info["num_classes"]
+        print(f"[data] dataset=COCO split={args.coco_split} classes={num_classes} "
+              f"train={len(train_loader.dataset)} query={len(query_loader.dataset)} "
+              f"database={len(db_loader.dataset)} img_size={args.img_size}")
+    else:
+        train_loader, query_loader, db_loader = build_loaders(
+            args.data_root, batch_size=args.batch_size, num_workers=args.num_workers,
+            train_per_class=args.train_per_class,
+            query_per_class=args.query_per_class,
+            database_per_class=args.database_per_class,
+        )
+        print(f"[data] train={len(train_loader.dataset)} query={len(query_loader.dataset)} "
+              f"database={len(db_loader.dataset)} (CIFAR-10, 无代理下载)")
 
-    model = DMSHNet(nbit=args.bits).to(device)
+    model = DMSHNet(nbit=args.bits, backbone=args.backbone,
+                    img_size=args.img_size, pretrained=args.pretrained).to(device)
+    print(f"[model] backbone={args.backbone} pretrained={args.pretrained} img_size={args.img_size} "
+          f"bits={args.bits} params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     criterion = DMSHLoss(nbit=args.bits, margin=args.margin,
                          tradeoff=args.tradeoff, nsim=args.nsim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -91,8 +120,8 @@ def main():
         optimizer, T_max=args.epochs, last_epoch=start_epoch - 1)
 
     history = []
-    last_ckpt = os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_last.pt")
-    best_ckpt = os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_best.pt")
+    last_ckpt = os.path.join(args.output_dir, f"dmsh_{args.dataset}_{args.bits}bit_last.pt")
+    best_ckpt = os.path.join(args.output_dir, f"dmsh_{args.dataset}_{args.bits}bit_best.pt")
     eval_done = False
     for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
@@ -130,7 +159,8 @@ def main():
         do_eval = (epoch == args.epochs) or (bool(args.eval_every) and epoch % args.eval_every == 0)
         cur_map = None
         if do_eval:
-            result = evaluate(model, query_loader, db_loader, device, args.bits)
+            result = evaluate(model, query_loader, db_loader, device, args.bits,
+                              top_k=args.map_k)
             cur_map = result["mAP"]
             eval_done = (epoch == args.epochs)
             tag = ""
@@ -139,14 +169,15 @@ def main():
                 torch.save({"model": model.state_dict(), "args": vars(args),
                             "epoch": epoch, "best_mAP": best_map, "mAP": cur_map}, best_ckpt)
                 tag = " *BEST*"
-            print(f"    -> mAP@all={cur_map:.4f} (best={best_map:.4f}){tag}", flush=True)
+            print(f"    -> {metric_name}={cur_map:.4f} (best={best_map:.4f}){tag}", flush=True)
 
         history.append({"epoch": epoch, **agg, "mAP": cur_map, "best_mAP": best_map})
         torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                     "args": vars(args), "epoch": epoch, "best_mAP": best_map}, last_ckpt)
 
     if not eval_done:
-        result = evaluate(model, query_loader, db_loader, device, args.bits)
+        result = evaluate(model, query_loader, db_loader, device, args.bits,
+                          top_k=args.map_k)
         cur_map = result["mAP"]
         if cur_map > best_map:
             best_map = cur_map
@@ -154,14 +185,14 @@ def main():
                         "epoch": args.epochs, "best_mAP": best_map, "mAP": cur_map}, best_ckpt)
         history[-1]["mAP"] = cur_map
         history[-1]["best_mAP"] = best_map
-        print(f"    -> mAP@all={cur_map:.4f} (best={best_map:.4f})", flush=True)
+        print(f"    -> {metric_name}={cur_map:.4f} (best={best_map:.4f})", flush=True)
 
-    print(f"[final] bits={args.bits} best_mAP@all={best_map:.4f} "
+    print(f"[final] bits={args.bits} best_{metric_name}={best_map:.4f} "
           f"(query={len(result['query_codes'])}, database={len(result['db_codes'])})")
-    np.savez_compressed(os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_codes.npz"),
+    np.savez_compressed(os.path.join(args.output_dir, f"dmsh_{args.dataset}_{args.bits}bit_codes.npz"),
                         query_codes=result["query_codes"], db_codes=result["db_codes"],
                         query_labels=result["query_labels"], db_labels=result["db_labels"])
-    with open(os.path.join(args.output_dir, f"dmsh_cifar10_{args.bits}bit_history.json"), "w",
+    with open(os.path.join(args.output_dir, f"dmsh_{args.dataset}_{args.bits}bit_history.json"), "w",
               encoding="utf-8") as f:
         json.dump(history, f, indent=2)
     print(f"[save] last={last_ckpt} best={best_ckpt}", flush=True)
