@@ -21,8 +21,12 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def load_coco_multilabel(root, split="val2017", min_class_count=0, verbose=True):
-    """返回 (labels N×C float32, file_names, class_ids, class_names)。"""
+def load_coco_multilabel(root, split="val2017", min_class_count=0, verbose=True,
+                         keep_cat_ids=None):
+    """返回 (labels N×C float32, file_names, class_ids, class_names)。
+
+    keep_cat_ids 给定时按该类别列表取列（用于训练/查询集口径一致）。
+    """
     ann_path = os.path.join(root, "annotations", f"instances_{split}.json")
     if not os.path.exists(ann_path):
         raise FileNotFoundError(f"缺少标注文件: {ann_path}")
@@ -45,7 +49,10 @@ def load_coco_multilabel(root, split="val2017", min_class_count=0, verbose=True)
 
     # 统计类别频次并筛掉长尾类
     counts = labels.sum(axis=0)
-    keep = np.where(counts >= min_class_count)[0]
+    if keep_cat_ids is not None:
+        keep = np.array([cat_col[c] for c in keep_cat_ids], dtype=np.int64)
+    else:
+        keep = np.where(counts >= min_class_count)[0]
     labels = labels[:, keep]
     class_ids = [cat_ids[i] for i in keep]
 
@@ -124,11 +131,13 @@ class _Wrapped(Dataset):
 
 def build_coco_loaders(root, split="val2017", img_size=224, batch_size=32, num_workers=0,
                        min_class_count=0, max_images=None, val_ratio=0.2, seed=0,
-                       balanced=False):
+                       balanced=False, cache_root=None, query_split=None):
     """返回 train / query / database 三个 DataLoader 与类别信息。
 
-    小规模验证协议：把同一 split（默认 val2017）按 val_ratio 随机切出查询集，
-    其余作为训练集，同时作为检索库。
+    query_split 为 None（小规模验证）：把 split 按 val_ratio 随机切成训练/查询，
+    训练部分同时作为检索库。
+    query_split 给定时（全量训练）：split 全部作为训练集与检索库，
+    另一个 split 全部作为查询集，类别口径以训练集为准。
     """
     labels, file_names, class_ids, class_names = load_coco_multilabel(
         root, split=split, min_class_count=min_class_count)
@@ -139,22 +148,41 @@ def build_coco_loaders(root, split="val2017", img_size=224, batch_size=32, num_w
         labels = labels[sel]
         file_names = [file_names[i] for i in sel]
 
-    n = len(file_names)
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(n)
-    n_query = max(1, int(round(n * val_ratio)))
-    query_idx = np.sort(perm[:n_query])
-    train_idx = np.sort(perm[n_query:])
+    if query_split:
+        query_labels, q_files, _, _ = load_coco_multilabel(
+            root, split=query_split, keep_cat_ids=class_ids, verbose=False)
+        train_labels = labels
+        print(f"[coco] 训练/库 split={split}({len(file_names)}) "
+              f"查询 split={query_split}({len(q_files)})", flush=True)
+    else:
+        n = len(file_names)
+        perm = np.random.RandomState(seed).permutation(n)
+        n_query = max(1, int(round(n * val_ratio)))
+        query_labels = labels[np.sort(perm[:n_query])]
+        q_files = [file_names[i] for i in np.sort(perm[:n_query])]
+        keep_rows = np.sort(perm[n_query:])
+        train_labels = labels[keep_rows]
+        file_names = [file_names[i] for i in keep_rows]
+        print(f"[coco] split={split} train={len(file_names)} query={len(q_files)}", flush=True)
 
-    train_labels = labels[train_idx]
-    query_labels = labels[query_idx]
-    print(f"[coco] split={split} train={len(train_idx)} query={len(query_idx)} "
-          f"每图标签数 train={train_labels.sum(1).mean():.2f}", flush=True)
+    print(f"[coco] train={len(train_labels)} query={len(query_labels)} "
+          f"每图标签数 train={train_labels.sum(1).mean():.2f} "
+          f"query={query_labels.sum(1).mean():.2f}", flush=True)
 
-    img_dir = os.path.join(root, split)
-    train_base = COCOMultiLabelDataset(img_dir, [file_names[i] for i in train_idx], train_labels)
-    db_base = COCOMultiLabelDataset(img_dir, [file_names[i] for i in train_idx], train_labels)
-    query_base = COCOMultiLabelDataset(img_dir, [file_names[i] for i in query_idx], query_labels)
+    def _dir(s):
+        d = os.path.join(cache_root, s) if cache_root else os.path.join(root, s)
+        if cache_root and not os.path.isdir(d):
+            raise FileNotFoundError(f"缓存目录不存在: {d}（先运行 build_coco_cache.py）")
+        return d
+
+    train_dir = _dir(split)
+    query_dir = _dir(query_split or split)
+    if cache_root:
+        print(f"[coco] 图像来源: 本地缓存 {cache_root}", flush=True)
+
+    train_base = COCOMultiLabelDataset(train_dir, file_names, train_labels)
+    db_base = COCOMultiLabelDataset(train_dir, file_names, train_labels)
+    query_base = COCOMultiLabelDataset(query_dir, q_files, query_labels)
 
     train_set = _Wrapped(train_base, train_labels, _Transform(img_size, train=True))
     db_set = _Wrapped(db_base, train_labels, _Transform(img_size, train=False))

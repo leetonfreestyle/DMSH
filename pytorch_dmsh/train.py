@@ -52,6 +52,8 @@ def parse_args():
     p.add_argument("--min-class-count", type=int, default=0, help="COCO 标注中剔除频次低于该值的类别")
     p.add_argument("--coco-max-images", type=int, default=None, help="COCO 小规模验证时随机取图数量")
     p.add_argument("--coco-val-ratio", type=float, default=0.2, help="COCO 从同 split 切出的查询集比例")
+    p.add_argument("--coco-cache-root", default=None, help="COCO 小尺寸图像缓存目录（build_coco_cache.py 产物）")
+    p.add_argument("--coco-query-split", default=None, help="单独指定查询集 split（如 val2017），缺省则从训练 split 切分")
     p.add_argument("--coco-balanced", action="store_true", help="COCO 训练启用类别均衡采样")
     p.add_argument("--map-k", type=int, default=None, help="评估 mAP@K；缺省为 mAP@all")
     p.add_argument("--smoke-test", action="store_true", help="小样本快速验证 GPU 训练与检索")
@@ -85,6 +87,7 @@ def main():
             batch_size=args.batch_size, num_workers=args.num_workers,
             min_class_count=args.min_class_count, max_images=args.coco_max_images,
             val_ratio=args.coco_val_ratio, balanced=args.coco_balanced,
+            cache_root=args.coco_cache_root, query_split=args.coco_query_split,
         )
         num_classes = coco_info["num_classes"]
         print(f"[data] dataset=COCO split={args.coco_split} classes={num_classes} "
@@ -116,6 +119,9 @@ def main():
         start_epoch = int(ck.get("epoch", 0))
         best_map = float(ck.get("best_mAP", ck.get("mAP", -1.0)))
         print(f"[resume] loaded {args.resume}: epoch={start_epoch} best_mAP={best_map:.4f}")
+    # 续训时 last_epoch >= 0，PyTorch 要求 param group 中显式带 initial_lr
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, last_epoch=start_epoch - 1)
 

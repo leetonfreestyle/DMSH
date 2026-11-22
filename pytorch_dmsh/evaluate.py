@@ -38,22 +38,22 @@ def hamming_map(query_codes, db_codes, query_onehot, db_onehot, device,
     qy = query_onehot.to(device).float()
     dby = db_onehot.to(device).float()
 
-    # 相关矩阵：标签重叠 >= 1（单标签即同类）
-    rel_all = (qy @ dby.t()) >= 1.0
-    n_rel_total = rel_all.sum(dim=1).float()
+    # 相关矩阵按查询分块现算，避免全量库时 (Nq, Nd) 常驻显存
     aps = []
     for start in range(0, q.size(0), chunk):
         end = min(start + chunk, q.size(0))
-        scores = q[start:end] @ db.t()          # 内积越大 => 汉明距离越小
+        qb, qyb = q[start:end], qy[start:end]
+        scores = qb @ db.t()                    # 内积越大 => 汉明距离越小
+        rel = (qyb @ dby.t()) >= 1.0            # 标签重叠 >= 1（单标签即同类）
+        n_rel = rel.sum(dim=1).float()
         if top_k is not None and top_k < db.size(0):
             order = scores.topk(top_k, dim=1, largest=True, sorted=True).indices
         else:
             order = scores.argsort(dim=1, descending=True)
-        rel = rel_all[start:end].gather(1, order).float()
+        rel = rel.gather(1, order).float()
         cum = rel.cumsum(dim=1)
         ranks = torch.arange(1, order.size(1) + 1, device=device).float().unsqueeze(0)
         precision = cum / ranks
-        n_rel = n_rel_total[start:end]
         if top_k is not None:
             n_rel = n_rel.clamp(max=float(top_k))
         valid = n_rel > 0
